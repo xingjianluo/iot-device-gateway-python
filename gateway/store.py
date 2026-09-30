@@ -13,6 +13,7 @@ from collections import OrderedDict
 from pathlib import Path
 
 from .models import (
+    AttemptResult,
     Command,
     CommandStatus,
     Device,
@@ -92,6 +93,28 @@ class Store:
                 if c.status == CommandStatus.QUEUED
             ]
 
+    def queue_size(self, device_id: str) -> int:
+        """Number of QUEUED commands currently occupying the offline queue."""
+        with self._lock:
+            return sum(
+                1
+                for c in self.commands.get(device_id, {}).values()
+                if c.status == CommandStatus.QUEUED
+            )
+
+    def requeue_command(self, command: Command) -> None:
+        """Move an existing command back to the tail of the FIFO queue.
+
+        Used for failure-driven retries: the same command_id keeps one slot
+        and one ordered position, so it can neither be duplicated nor cover
+        any other pending command.
+        """
+        with self._lock:
+            bucket = self.commands.setdefault(command.device_id, OrderedDict())
+            bucket[command.command_id] = command
+            bucket.move_to_end(command.command_id)
+            self._persist()
+
     # -- persistence -----------------------------------------------------
     def _persist(self) -> None:
         if not self.persist_path:
@@ -103,6 +126,8 @@ class Store:
                     "status": d.status.value,
                     "protocol_version": d.protocol_version,
                     "last_seen": d.last_seen,
+                    "max_retries": d.max_retries,
+                    "queue_capacity": d.queue_capacity,
                 }
                 for d in self.devices.values()
             },
@@ -130,6 +155,18 @@ class Store:
                         "sent_at": c.sent_at,
                         "ack_deadline": c.ack_deadline,
                         "ack_count": c.ack_count,
+                        "attempt": c.attempt,
+                        "result_count": c.result_count,
+                        "results": [
+                            {
+                                "attempt": r.attempt,
+                                "success": r.success,
+                                "duration_ms": r.duration_ms,
+                                "error_code": r.error_code,
+                                "reported_at": r.reported_at,
+                            }
+                            for r in c.results
+                        ],
                     }
                     for c in cmds.values()
                 ]
@@ -149,6 +186,8 @@ class Store:
                 status=DeviceStatus(d["status"]),
                 protocol_version=d.get("protocol_version", "1.0"),
                 last_seen=d.get("last_seen", 0.0),
+                max_retries=d.get("max_retries", 0),
+                queue_capacity=d.get("queue_capacity"),
             )
         for device_id, recs in data.get("telemetry", {}).items():
             bucket = self.telemetry.setdefault(device_id, OrderedDict())
@@ -174,4 +213,16 @@ class Store:
                     sent_at=c.get("sent_at"),
                     ack_deadline=c.get("ack_deadline"),
                     ack_count=c.get("ack_count", 0),
+                    attempt=c.get("attempt", 0),
+                    result_count=c.get("result_count", 0),
+                    results=[
+                        AttemptResult(
+                            attempt=r["attempt"],
+                            success=r["success"],
+                            duration_ms=r["duration_ms"],
+                            error_code=r.get("error_code"),
+                            reported_at=r.get("reported_at", 0.0),
+                        )
+                        for r in c.get("results", [])
+                    ],
                 )

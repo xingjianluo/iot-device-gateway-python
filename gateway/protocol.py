@@ -19,6 +19,17 @@ from .models import RejectReason
 
 SUPPORTED_VERSIONS: frozenset[str] = frozenset({"1.0", "2.0"})
 
+# Clients from these versions can report command execution results.
+# Legacy versions (1.0) only acknowledge receipt: ACKED is their terminal,
+# definitive "delivered; outcome unknown" verdict and is never upgraded or
+# retried by the gateway, so mixed-version fleets get one stable semantics.
+RESULT_REPORT_VERSIONS: frozenset[str] = frozenset({"2.0"})
+
+
+def supports_result_report(version: str) -> bool:
+    """Whether a client speaking ``version`` can report execution results."""
+    return version in RESULT_REPORT_VERSIONS
+
 # Per-version defaults applied when the client omits a field.
 _FIELD_DEFAULTS: dict[str, dict[str, Any]] = {
     "1.0": {"seq": 0, "qos": 0},

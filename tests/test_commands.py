@@ -8,7 +8,7 @@ def test_dispatch_offline_queues_then_flush_fifo(gateway, clock):
     gateway.register("d1", "s")
     ids = []
     for name in ["reboot", "config", "ota"]:
-        cmd, reason = gateway.dispatch("d1", name)
+        cmd, _reason = gateway.dispatch("d1", name)
         print(f"offline dispatch {name}: status={cmd.status.value}")
         assert cmd.status == CommandStatus.QUEUED
         ids.append(cmd.command_id)
@@ -92,7 +92,7 @@ def test_concurrent_ack_and_cancel_do_not_corrupt_state(gateway, clock):
         acks = pool.map(lambda _: gateway.ack("d1", "s", cmd.command_id), range(32))
         cancels = pool.map(lambda _: gateway.cancel("d1", cmd.command_id), range(32))
         ack_results = list(acks)
-        cancel_results = list(cancels)
+        list(cancels)
     final = gateway.store.get_command("d1", cmd.command_id)
     wins = sum(1 for r in ack_results if r.accepted and not r.duplicate)
     print(f"32 acks vs 32 cancels: first-acks={wins} final={final.status.value}")

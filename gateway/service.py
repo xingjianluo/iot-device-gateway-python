@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Any
 
 from .commands import CommandService
-from .telemetry import TelemetryService
 from .devices import DeviceRegistry
 from .models import (
     AckResult,
@@ -17,6 +16,7 @@ from .models import (
     system_clock,
 )
 from .store import Store
+from .telemetry import TelemetryService
 
 
 class Gateway:
@@ -32,8 +32,21 @@ class Gateway:
         self.commands = CommandService(self.store, self.devices, clock)
 
     # convenience pass-throughs ------------------------------------------
-    def register(self, device_id: str, secret: str, protocol_version: str = "1.0") -> Device:
-        return self.devices.register(device_id, secret, protocol_version)
+    def register(
+        self,
+        device_id: str,
+        secret: str,
+        protocol_version: str = "1.0",
+        max_retries: int = 0,
+        queue_capacity: int | None = None,
+    ) -> Device:
+        return self.devices.register(
+            device_id,
+            secret,
+            protocol_version,
+            max_retries=max_retries,
+            queue_capacity=queue_capacity,
+        )
 
     def connect(self, device_id: str) -> list[Command]:
         """Mark device online and flush its offline queue, FIFO."""
@@ -42,6 +55,10 @@ class Gateway:
 
     def disconnect(self, device_id: str) -> None:
         self.devices.disconnect(device_id)
+
+    def flush(self, device_id: str) -> list[Command]:
+        """Redeliver the device's QUEUED commands in FIFO order."""
+        return self.commands.flush(device_id)
 
     def ingest(
         self, device_id: str, secret: str, version: str, message: dict[str, Any]
@@ -58,6 +75,32 @@ class Gateway:
 
     def cancel(self, device_id: str, command_id: str):
         return self.commands.cancel(device_id, command_id)
+
+    def report_result(
+        self,
+        device_id: str,
+        secret: str,
+        command_id: str,
+        success: bool,
+        duration_ms: int,
+        error_code: str | None = None,
+    ):
+        return self.commands.report_result(
+            device_id, secret, command_id, success, duration_ms, error_code
+        )
+
+    def queue_status(self, device_id: str):
+        return self.commands.queue_status(device_id)
+
+    def configure_policy(
+        self,
+        device_id: str,
+        max_retries: int | None = None,
+        queue_capacity: int | None = None,
+    ):
+        return self.devices.configure_policy(
+            device_id, max_retries, queue_capacity
+        )
 
     def expire(self, device_id: str | None = None) -> list[Command]:
         return self.commands.expire(device_id)
