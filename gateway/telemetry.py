@@ -10,6 +10,7 @@ Rules:
 - The per-device lock serializes the check-then-insert so concurrent
   ingestion of the same message_id yields exactly one acceptance.
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -25,8 +26,8 @@ from .models import (
 from .protocol import ProtocolError, normalize_message
 from .store import Store
 
-DEFAULT_MAX_PAST_SKEW = 24 * 3600.0   # accept data up to 24h old
-DEFAULT_MAX_FUTURE_SKEW = 5 * 60.0    # accept at most 5min clock-ahead
+DEFAULT_MAX_PAST_SKEW = 24 * 3600.0  # accept data up to 24h old
+DEFAULT_MAX_FUTURE_SKEW = 5 * 60.0  # accept at most 5min clock-ahead
 
 
 class TelemetryService:

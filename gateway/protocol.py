@@ -11,6 +11,7 @@ Rules (deterministic and stable):
   upgrade the verdict for any stored/historical message is reproducible
   by re-running normalize_message with its recorded version.
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -18,6 +19,11 @@ from typing import Any
 from .models import RejectReason
 
 SUPPORTED_VERSIONS: frozenset[str] = frozenset({"1.0", "2.0"})
+
+# Client versions that can report command *execution* results (success /
+# failure / error_code / duration). v1.0 clients only send acks: for them
+# ACKED is the terminal conclusion (never retried, see commands.py).
+RESULT_CAPABLE_VERSIONS: frozenset[str] = frozenset({"2.0"})
 
 # Per-version defaults applied when the client omits a field.
 _FIELD_DEFAULTS: dict[str, dict[str, Any]] = {

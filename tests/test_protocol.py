@@ -1,4 +1,5 @@
 """Protocol version compatibility: defaults, rejection, reproducibility."""
+
 import pytest
 
 from gateway.models import RejectReason

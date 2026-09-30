@@ -5,20 +5,26 @@ serialize lifecycle operations (telemetry ingest, command transitions)
 for a single device so concurrent operations on the same device cannot
 overwrite each other, while different devices proceed in parallel.
 """
+
 from __future__ import annotations
 
 import json
 import threading
 from collections import OrderedDict
 from pathlib import Path
+from typing import Any
 
 from .models import (
     Command,
     CommandStatus,
     Device,
     DeviceStatus,
+    ExecutionResult,
     TelemetryRecord,
 )
+
+# Delivered but not yet settled: ack timeout/result may still change them.
+IN_FLIGHT_STATES = frozenset({CommandStatus.SENT, CommandStatus.ACKED})
 
 
 class Store:
@@ -83,14 +89,52 @@ class Store:
         with self._lock:
             return self.commands.get(device_id, {}).get(command_id)
 
-    def queued_commands(self, device_id: str) -> list[Command]:
-        """Commands awaiting (re)delivery, in FIFO order."""
+    def queued_commands(
+        self, device_id: str, now: float | None = None
+    ) -> list[Command]:
+        """Commands awaiting (re)delivery, in FIFO order.
+
+        Commands parked with a retry ``not_before`` in the future are
+        skipped when ``now`` is provided, but keep their queue position.
+        """
         with self._lock:
             return [
                 c
                 for c in self.commands.get(device_id, {}).values()
                 if c.status == CommandStatus.QUEUED
+                and (now is None or c.not_before is None or c.not_before <= now)
             ]
+
+    def queued_count(self, device_id: str) -> int:
+        with self._lock:
+            return sum(
+                1
+                for c in self.commands.get(device_id, {}).values()
+                if c.status == CommandStatus.QUEUED
+            )
+
+    def in_flight_count(self, device_id: str) -> int:
+        with self._lock:
+            return sum(
+                1
+                for c in self.commands.get(device_id, {}).values()
+                if c.status in IN_FLIGHT_STATES
+            )
+
+    def requeue_command(self, command: Command) -> None:
+        """Move a delivered command back to the tail of its FIFO queue.
+
+        Re-inserting at the tail makes the retry order explainable: the
+        retry runs after everything already waiting, and earlier pending
+        commands are never overwritten. Caller must hold the device lock.
+        """
+        bucket = self.commands.setdefault(command.device_id, OrderedDict())
+        previous = bucket.pop(command.command_id, None)
+        if previous is None:
+            bucket[command.command_id] = command
+        else:
+            bucket[command.command_id] = previous  # append at tail
+        self._persist()
 
     # -- persistence -----------------------------------------------------
     def _persist(self) -> None:
@@ -103,6 +147,9 @@ class Store:
                     "status": d.status.value,
                     "protocol_version": d.protocol_version,
                     "last_seen": d.last_seen,
+                    "max_queue_size": d.max_queue_size,
+                    "max_retries": d.max_retries,
+                    "retry_backoff": d.retry_backoff,
                 }
                 for d in self.devices.values()
             },
@@ -130,6 +177,28 @@ class Store:
                         "sent_at": c.sent_at,
                         "ack_deadline": c.ack_deadline,
                         "ack_count": c.ack_count,
+                        "attempt": c.attempt,
+                        "max_retries": c.max_retries,
+                        "retry_backoff": c.retry_backoff,
+                        "not_before": c.not_before,
+                        "result": None
+                        if c.result is None
+                        else {
+                            "success": c.result.success,
+                            "duration": c.result.duration,
+                            "error_code": c.result.error_code,
+                            "attempt": c.result.attempt,
+                        },
+                        "result_received_at": c.result_received_at,
+                        "last_result": None
+                        if c.last_result is None
+                        else {
+                            "success": c.last_result.success,
+                            "duration": c.last_result.duration,
+                            "error_code": c.last_result.error_code,
+                            "attempt": c.last_result.attempt,
+                        },
+                        "failed_attempts": list(c.failed_attempts),
                     }
                     for c in cmds.values()
                 ]
@@ -149,6 +218,9 @@ class Store:
                 status=DeviceStatus(d["status"]),
                 protocol_version=d.get("protocol_version", "1.0"),
                 last_seen=d.get("last_seen", 0.0),
+                max_queue_size=d.get("max_queue_size", 100),
+                max_retries=d.get("max_retries", 3),
+                retry_backoff=d.get("retry_backoff", 0.0),
             )
         for device_id, recs in data.get("telemetry", {}).items():
             bucket = self.telemetry.setdefault(device_id, OrderedDict())
@@ -174,4 +246,23 @@ class Store:
                     sent_at=c.get("sent_at"),
                     ack_deadline=c.get("ack_deadline"),
                     ack_count=c.get("ack_count", 0),
+                    attempt=c.get("attempt", 1),
+                    max_retries=c.get("max_retries", 3),
+                    retry_backoff=c.get("retry_backoff", 0.0),
+                    not_before=c.get("not_before"),
+                    result=_load_result(c.get("result")),
+                    result_received_at=c.get("result_received_at"),
+                    last_result=_load_result(c.get("last_result")),
+                    failed_attempts=list(c.get("failed_attempts", [])),
                 )
+
+
+def _load_result(data: dict[str, Any] | None):
+    if data is None:
+        return None
+    return ExecutionResult(
+        success=data["success"],
+        duration=data["duration"],
+        error_code=data.get("error_code"),
+        attempt=data.get("attempt", 1),
+    )
