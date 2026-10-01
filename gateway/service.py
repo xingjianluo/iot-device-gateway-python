@@ -83,10 +83,17 @@ class Gateway:
         command_id: str,
         success: bool,
         duration_ms: int,
+        attempt: int,
         error_code: str | None = None,
     ):
         return self.commands.report_result(
-            device_id, secret, command_id, success, duration_ms, error_code
+            device_id,
+            secret,
+            command_id,
+            success,
+            duration_ms,
+            attempt,
+            error_code,
         )
 
     def queue_status(self, device_id: str):

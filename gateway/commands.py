@@ -27,20 +27,24 @@ Rules:
   rejected with INVALID_STATE. For v1.0 devices ACKED is terminal, so a
   racing cancel can no longer overwrite it; for v2.0 devices ACKED is an
   intermediate "executing" state.
-- report_result() (v2.0 only) legal only from ACKED. Reports arriving out
-  of order are each rejected with a distinguishable reason: before ack ->
-  RESULT_BEFORE_ACK, after timeout -> RESULT_AFTER_TIMEOUT, after cancel
-  -> RESULT_AFTER_CANCEL, legacy client -> RESULT_UNSUPPORTED_VERSION.
-  Repeating the same (success, error_code) verdict for a terminal command
-  is a duplicate and never changes the recorded conclusion; a *different*
-  verdict is rejected with CONFLICTING_RESULT. (A duplicate of an older
-  attempt's verdict that arrives only after the command was requeued for
-  retry lands while the command is QUEUED/SENT: only the currently ACKED
-  attempt accepts results, so it is reported as RESULT_BEFORE_ACK and
-  changes nothing -- the earlier verdict was already recorded once.)
-  Every lifecycle action is serialized by the per-device lock, so however
-  ack/result/cancel/expire interleave, a command lands in exactly one
-  terminal state.
+- report_result() (v2.0 only) requires the client to echo the ``attempt``
+  of the delivery it is answering (the gateway includes it on every
+  dispatch/flush). Verdicts are attributed to that attempt, never to "the
+  currently ACKED round", so a jitter-delayed repeat of an older round can
+  never be booked onto a newer one. The first verdict ever recorded for an
+  attempt fixes that attempt's conclusion; a repeated identical verdict is
+  a duplicate (accepted, idempotent) and a contradictory verdict for the
+  same attempt is CONFLICTING_RESULT -- both are observable, neither moves
+  the command, spends a retry, or adds a record. Reports whose attempt has
+  not been delivered yet are rejected INVALID_STATE; reports for the live
+  round that arrive before ack / after timeout / after cancel still get
+  their distinguishable RESULT_BEFORE_ACK / RESULT_AFTER_TIMEOUT /
+  RESULT_AFTER_CANCEL reasons, and a legacy client gets
+  RESULT_UNSUPPORTED_VERSION. Only the first verdict of the *currently
+  ACKED* attempt drives the state machine (success -> terminal; failure ->
+  requeue or terminal), so however ack/result/cancel/expire interleave, a
+  command lands in exactly one terminal state and is executed once per
+  delivery, never twice.
 - A reported failure is requeued to the FIFO tail while
   attempt <= max_retries; retries reuse the same command_id and never
   exceed the capacity admission for *new* dispatches. Once the cap is
@@ -60,6 +64,7 @@ from typing import Any
 from .devices import DeviceRegistry
 from .models import (
     TERMINAL_AFTER_ACK_VERSIONS,
+    TERMINAL_COMMAND_STATES,
     AckResult,
     AttemptResult,
     Clock,
@@ -199,6 +204,7 @@ class CommandService:
         command_id: str,
         success: bool,
         duration_ms: int,
+        attempt: int,
         error_code: str | None = None,
     ) -> ResultReportResult:
         device, reason = self._registry.authenticate(device_id, secret)
@@ -212,7 +218,13 @@ class CommandService:
                 accepted=False,
                 reason=RejectReason.RESULT_UNSUPPORTED_VERSION,
             )
-        if duration_ms < 0 or (not success and not error_code):
+        if (
+            duration_ms < 0
+            or (not success and not error_code)
+            or not isinstance(attempt, int)
+            or isinstance(attempt, bool)
+            or attempt < 1
+        ):
             return ResultReportResult(
                 accepted=False, reason=RejectReason.INVALID_STATE
             )
@@ -222,40 +234,101 @@ class CommandService:
                 return ResultReportResult(
                     accepted=False, reason=RejectReason.UNKNOWN_COMMAND
                 )
+
+            # Attribute the verdict to the delivery attempt it answers. A
+            # verdict already recorded for that attempt is fixed for good:
+            # the same verdict repeated (however late, in whatever phase)
+            # is an idempotent duplicate; a contradictory verdict for the
+            # same attempt is rejected. Neither ever moves the command.
+            recorded = self._find_result(command, attempt)
+            if recorded is not None:
+                command.result_count += 1  # observation only
+                self._store._persist()
+                if recorded.success == success and recorded.error_code == error_code:
+                    return ResultReportResult(
+                        accepted=True,
+                        duplicate=True,
+                        attempt=attempt,
+                        current_attempt=command.attempt,
+                        terminal=command.status in TERMINAL_COMMAND_STATES,
+                    )
+                return ResultReportResult(
+                    accepted=False,
+                    reason=RejectReason.CONFLICTING_RESULT,
+                    attempt=attempt,
+                    current_attempt=command.attempt,
+                    terminal=command.status in TERMINAL_COMMAND_STATES,
+                )
+
+            # First report for this attempt. While the command has not
+            # reached the result window of any round (never delivered, or a
+            # retry round still QUEUED/SENT), no new verdict is accepted:
+            # "result before ack". (A stale verdict of an earlier round
+            # never reaches here -- it was matched and handled above.)
             status = command.status
             if status in (CommandStatus.QUEUED, CommandStatus.SENT):
                 return ResultReportResult(
-                    accepted=False, reason=RejectReason.RESULT_BEFORE_ACK
+                    accepted=False,
+                    reason=RejectReason.RESULT_BEFORE_ACK,
+                    attempt=attempt,
+                    current_attempt=command.attempt,
+                )
+            # A round that has not been delivered yet cannot have a genuine
+            # result in any later phase either.
+            if attempt > command.attempt:
+                return ResultReportResult(
+                    accepted=False,
+                    reason=RejectReason.INVALID_STATE,
+                    attempt=attempt,
+                    current_attempt=command.attempt,
                 )
             if status == CommandStatus.TIMED_OUT:
                 return ResultReportResult(
-                    accepted=False, reason=RejectReason.RESULT_AFTER_TIMEOUT
+                    accepted=False,
+                    reason=RejectReason.RESULT_AFTER_TIMEOUT,
+                    attempt=attempt,
+                    current_attempt=command.attempt,
                 )
             if status == CommandStatus.CANCELLED:
                 return ResultReportResult(
-                    accepted=False, reason=RejectReason.RESULT_AFTER_CANCEL
+                    accepted=False,
+                    reason=RejectReason.RESULT_AFTER_CANCEL,
+                    attempt=attempt,
+                    current_attempt=command.attempt,
                 )
             if status == CommandStatus.ACKED:
+                # only the currently ACKED round accepts its first verdict;
+                # an earlier round with no recorded verdict reaching this
+                # state is impossible (retry needs a recorded failure).
+                if attempt != command.attempt:
+                    return ResultReportResult(
+                        accepted=False,
+                        reason=RejectReason.INVALID_STATE,
+                        attempt=attempt,
+                        current_attempt=command.attempt,
+                    )
                 return self._record_result(device, command, success,
                                            duration_ms, error_code)
-            # already settled: the conclusion is fixed. An identical
-            # verdict is a duplicate; a contradictory one is rejected.
-            last = command.results[-1]
-            command.result_count += 1  # observation only
-            self._store._persist()
-            if last.success == success and last.error_code == error_code:
-                return ResultReportResult(
-                    accepted=True,
-                    duplicate=True,
-                    attempt=last.attempt,
-                    terminal=True,
-                )
+            # Terminal with no verdict for this attempt: the conclusion was
+            # fixed by a competing lifecycle action, so the reported verdict
+            # can no longer replace it.
             return ResultReportResult(
                 accepted=False,
-                reason=RejectReason.CONFLICTING_RESULT,
-                attempt=last.attempt,
+                reason=RejectReason.INVALID_STATE,
+                attempt=attempt,
+                current_attempt=command.attempt,
                 terminal=True,
             )
+
+    @staticmethod
+    def _find_result(
+        command: Command, attempt: int
+    ) -> AttemptResult | None:
+        """The verdict already recorded for ``attempt``, if any."""
+        for record in command.results:
+            if record.attempt == attempt:
+                return record
+        return None
 
     def _record_result(
         self,
@@ -278,7 +351,10 @@ class CommandService:
             command.status = CommandStatus.SUCCEEDED
             self._store._persist()
             return ResultReportResult(
-                accepted=True, attempt=record.attempt, terminal=True
+                accepted=True,
+                attempt=record.attempt,
+                current_attempt=record.attempt,
+                terminal=True,
             )
         if command.attempt <= device.max_retries:
             # retries remain: requeue to the tail behind other pending
@@ -291,6 +367,7 @@ class CommandService:
             return ResultReportResult(
                 accepted=True,
                 attempt=record.attempt,
+                current_attempt=record.attempt,
                 terminal=False,
                 retried=True,
             )
@@ -301,7 +378,10 @@ class CommandService:
         )
         self._store._persist()
         return ResultReportResult(
-            accepted=True, attempt=record.attempt, terminal=True
+            accepted=True,
+            attempt=record.attempt,
+            current_attempt=record.attempt,
+            terminal=True,
         )
 
     def _make_attempt_result(

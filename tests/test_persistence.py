@@ -44,11 +44,11 @@ def test_results_attempts_and_retry_queue_survive_restart(tmp_path):
     g1.connect("d1")
     cmd, _ = g1.dispatch("d1", "reboot")
     g1.ack("d1", "s", cmd.command_id)
-    g1.report_result("d1", "s", cmd.command_id, False, 120, "E_BUSY")  # requeued
+    g1.report_result("d1", "s", cmd.command_id, False, 120, 1, "E_BUSY")  # requeued
     # a terminal success on a second command survives with its result record
     other, _ = g1.dispatch("d1", "config")
     g1.ack("d1", "s", other.command_id)
-    g1.report_result("d1", "s", other.command_id, True, 15)
+    g1.report_result("d1", "s", other.command_id, True, 15, 1)
 
     g2 = Gateway(persist_path=path, clock=clock)  # "restart"
     device = g2.store.get_device("d1")

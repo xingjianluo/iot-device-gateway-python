@@ -13,7 +13,7 @@ def test_failure_requeued_and_redelivered_with_incremented_attempt(gateway, cloc
     gateway.ack("d1", "s", cid)
 
     # first failure -> retry remains; command goes back to the queue tail
-    r1 = gateway.report_result("d1", "s", cid, False, 100, "E_BUSY")
+    r1 = gateway.report_result("d1", "s", cid, False, 100, 1, "E_BUSY")
     print(f"failure #1: accepted={r1.accepted} retried={r1.retried} attempt={r1.attempt}")
     assert r1.accepted and r1.retried and r1.attempt == 1
     stored = gateway.store.get_command("d1", cid)
@@ -27,7 +27,7 @@ def test_failure_requeued_and_redelivered_with_incremented_attempt(gateway, cloc
     assert [c.command_id for c in delivered] == [cid]  # no duplication
     assert delivered[0].attempt == 2
     gateway.ack("d1", "s", cid)
-    r2 = gateway.report_result("d1", "s", cid, False, 80, "E_BUSY")
+    r2 = gateway.report_result("d1", "s", cid, False, 80, 2, "E_BUSY")
     assert r2.retried and r2.attempt == 2
 
     # attempt 3 (last allowed): another failure exhausts the policy
@@ -35,7 +35,7 @@ def test_failure_requeued_and_redelivered_with_incremented_attempt(gateway, cloc
     redelivered = gateway.connect("d1")
     assert redelivered[0].attempt == 3
     gateway.ack("d1", "s", cid)
-    r3 = gateway.report_result("d1", "s", cid, False, 60, "E_DEAD")
+    r3 = gateway.report_result("d1", "s", cid, False, 60, 3, "E_DEAD")
     print(f"failure #3: terminal={r3.terminal} retried={r3.retried}")
     assert r3.terminal and not r3.retried
     final = gateway.store.get_command("d1", cid)
@@ -51,11 +51,11 @@ def test_success_after_retry_succeeds_within_cap(gateway, clock):
     cid = cmd.command_id
     for attempt in (1, 2):
         gateway.ack("d1", "s", cid)
-        r = gateway.report_result("d1", "s", cid, False, 10, "E_AGAIN")
+        r = gateway.report_result("d1", "s", cid, False, 10, attempt, "E_AGAIN")
         assert r.attempt == attempt and r.retried
         gateway.flush("d1")
     gateway.ack("d1", "s", cid)
-    r = gateway.report_result("d1", "s", cid, True, 42)
+    r = gateway.report_result("d1", "s", cid, True, 42, 3)
     print(f"success on attempt {r.attempt} -> terminal={r.terminal}")
     assert r.attempt == 3 and r.terminal
     assert gateway.store.get_command("d1", cid).status == CommandStatus.SUCCEEDED
@@ -68,7 +68,7 @@ def test_no_retry_policy_fails_terminal_without_requeue(gateway, clock):
     gateway.connect("d1")
     cmd, _ = gateway.dispatch("d1", "reboot")
     gateway.ack("d1", "s", cmd.command_id)
-    r = gateway.report_result("d1", "s", cmd.command_id, False, 5, "E_X")
+    r = gateway.report_result("d1", "s", cmd.command_id, False, 5, 1, "E_X")
     print(f"max_retries=0 failure: terminal={r.terminal} retried={r.retried}")
     assert r.terminal and not r.retried
     final = gateway.store.get_command("d1", cmd.command_id)
@@ -85,7 +85,7 @@ def test_retry_goes_behind_already_pending_commands(gateway, clock):
     gateway.ack("d1", "s", first.command_id)
     # A fails while online: retry is queued, but B is dispatched offline
     # afterwards and must queue behind A's retry.
-    r = gateway.report_result("d1", "s", first.command_id, False, 9, "E_X")
+    r = gateway.report_result("d1", "s", first.command_id, False, 9, 1, "E_X")
     assert r.retried
     gateway.disconnect("d1")
     queued_d, _ = gateway.dispatch("d1", "op-D")
@@ -121,7 +121,7 @@ def test_capacity_full_and_retry_interplay_keeps_order_no_loss(gateway, clock):
 
     # A fails -> one retry requeued (bypasses admission: already accepted)
     gateway.ack("d1", "s", a.command_id)
-    r = gateway.report_result("d1", "s", a.command_id, False, 3, "E_X")
+    r = gateway.report_result("d1", "s", a.command_id, False, 3, 1, "E_X")
     print(f"A retry requeued at full capacity: retried={r.retried}")
     assert r.retried
     # while A waits, a new command for the (online) device is delivered
@@ -147,22 +147,46 @@ def test_capacity_full_and_retry_interplay_keeps_order_no_loss(gateway, clock):
 
 def test_stale_duplicate_of_old_attempt_after_requeue_changes_nothing(gateway, clock):
     """Failure #1 was recorded once and requeued. A jitter-delivered repeat
-    of that old verdict arrives while the retry is QUEUED: it is rejected
-    (only the ACKED attempt accepts results), recorded zero extra times."""
+    of that old verdict arrives while the retry is QUEUED: it is attributed
+    to attempt 1, recognized as an idempotent duplicate of the verdict
+    already recorded for that round, and changes nothing -- no extra record,
+    no extra retry, the pending round is untouched."""
     gateway.register("d1", "s", protocol_version="2.0", max_retries=2)
     gateway.connect("d1")
     cmd, _ = gateway.dispatch("d1", "reboot")
     cid = cmd.command_id
     gateway.ack("d1", "s", cid)
-    first = gateway.report_result("d1", "s", cid, False, 100, "E_BUSY")
+    first = gateway.report_result("d1", "s", cid, False, 100, 1, "E_BUSY")
     assert first.retried
     # command is now QUEUED for attempt 2; old verdict's duplicate shows up
-    stale = gateway.report_result("d1", "s", cid, False, 100, "E_BUSY")
-    print(f"stale duplicate while QUEUED -> accepted={stale.accepted} reason={stale.reason}")
-    assert not stale.accepted and stale.reason == RejectReason.RESULT_BEFORE_ACK
+    stale = gateway.report_result("d1", "s", cid, False, 100, 1, "E_BUSY")
+    print(
+        f"stale duplicate while QUEUED -> accepted={stale.accepted} "
+        f"duplicate={stale.duplicate} attempt={stale.attempt} "
+        f"current_attempt={stale.current_attempt} retried={stale.retried}"
+    )
+    assert stale.accepted and stale.duplicate
+    assert stale.attempt == 1 and stale.current_attempt == 1
+    assert not stale.retried and not stale.terminal
     stored = gateway.store.get_command("d1", cid)
     assert stored.status == CommandStatus.QUEUED
     assert len(stored.results) == 1 and stored.results[0].attempt == 1
+    # and again: any number of late repeats stay idempotent
+    again = gateway.report_result("d1", "s", cid, False, 100, 1, "E_BUSY")
+    assert again.duplicate
+    assert len(gateway.store.get_command("d1", cid).results) == 1
+    # the retry round still executes normally and its own verdict counts
+    delivered = gateway.connect("d1")
+    assert delivered[0].attempt == 2
+    gateway.ack("d1", "s", cid)
+    ok = gateway.report_result("d1", "s", cid, True, 7, 2)
+    print(f"real verdict of attempt 2 after stale echoes: "
+          f"accepted={ok.accepted} terminal={ok.terminal}")
+    assert ok.accepted and ok.terminal
+    final = gateway.store.get_command("d1", cid)
+    assert final.status == CommandStatus.SUCCEEDED
+    assert [r.attempt for r in final.results] == [1, 2]
+    assert gateway.flush("d1") == []  # no phantom third execution
 
 
 def test_legacy_v1_never_retried_even_with_policy(gateway, clock):
@@ -172,7 +196,7 @@ def test_legacy_v1_never_retried_even_with_policy(gateway, clock):
     gateway.connect("old")
     cmd, _ = gateway.dispatch("old", "reboot")
     gateway.ack("old", "s", cmd.command_id)
-    r = gateway.report_result("old", "s", cmd.command_id, False, 1, "E_X")
+    r = gateway.report_result("old", "s", cmd.command_id, False, 1, 1, "E_X")
     print(f"v1.0 failure report -> {r.reason}; status stays ACKED")
     assert r.reason == RejectReason.RESULT_UNSUPPORTED_VERSION
     stored = gateway.store.get_command("old", cmd.command_id)

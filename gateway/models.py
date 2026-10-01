@@ -103,7 +103,10 @@ class Command:
     # delivery attempts: 0 while QUEUED, 1 on first delivery, n on nth retry
     attempt: int = 0
     result_count: int = 0
-    # one record per reported attempt (append-only)
+    # one record per reported attempt (append-only); at most one record per
+    # attempt number -- the first verdict recorded for an attempt is final,
+    # later reports for the same attempt are duplicates/conflicts, never
+    # appended
     results: list[AttemptResult] = field(default_factory=list)
 
 
@@ -126,7 +129,11 @@ class ResultReportResult:
     accepted: bool
     reason: RejectReason | None = None
     duplicate: bool = False
+    # delivery attempt the report's verdict was attributed to
     attempt: int = 0
+    # delivery attempt the command is currently on (lets callers tell a
+    # late duplicate of an older attempt apart from the live round)
+    current_attempt: int = 0
     terminal: bool = False
     # commands requeued for retry as a consequence of this report
     retried: bool = False

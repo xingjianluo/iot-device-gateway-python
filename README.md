@@ -56,18 +56,29 @@ CANCELLED (终态)   CANCELLED (终态) +--v2.0 上报失败、仍有重试名�
   - **v1.0 客户端**：`ACKED` 就是它的终态（“已送达，结果未知”），
     网关绝不替它推断成功/失败，也不会重试；竞争中的取消也无法再推翻它。
   - **v2.0 客户端**：`ACKED` 只是“已收到、执行中”的中间态。
-- `report_result`（**仅 v2.0**）只能在 `ACKED` 上被接受。网络抖动导致
-  ack/结果/取消/超时乱序到达时，每种越序到达都有**可互相区分的拒绝原因**：
-  - 未确认先报结果（`QUEUED`/`SENT`）→ `result_before_ack`
-  - 超时后报结果 → `result_after_timeout`
-  - 取消后报结果 → `result_after_cancel`
-  - v1.0 客户端报结果 → `result_unsupported_version`
-  - 对已定终态再报**相同**结论（success+error_code 相同）→
-    `accepted=true, duplicate=true`，只记一次、结论不变；
-    报**矛盾**结论 → `conflicting_result`，既定结论不被改变。
+- `report_result`（**仅 v2.0**）按**投递轮次 `attempt` 归属**判定，而不是按
+  “当前是不是 ACKED”。设备上报时必须回显该轮投递下发的 `attempt`
+  （`dispatch`/`flush` 的响应里带 `attempt`）。**同一轮的第一个结论一旦记录就
+  固定**，无论这个重复包晚多久到、到达时命令处于哪个阶段：
+  - 同一轮再报**相同**结论（success+error_code 相同）→
+    `accepted=true, duplicate=true`，只算一次：不追加记录、不消耗重试名额、
+    不改变任何状态。
+  - 同一轮报**矛盾**结论（如该轮已记 `E_BUSY`，又来一个 `E_OTHER`/成功）→
+    `conflicting_result`，既定结论不被改变。
+  - 因此**上一轮失败结果的迟到重复包，在命令已重排、重试轮已下发甚至已确认后
+    到达，也只会被识别为该旧轮的幂等重复**：不会再排一次重试，不会把只允许
+    重试一次的命令提前判成 `RETRIES_EXHAUSTED`，也不会顶替当前轮真正的结果。
+  - 第一轮（当前在途轮）结论之外的越序到达仍有**可互相区分的拒绝原因**：
+    - 未确认先报结果（`QUEUED`/`SENT`，或轮次尚未投递）→ `result_before_ack`
+    - 超时后报结果 → `result_after_timeout`
+    - 取消后报结果 → `result_after_cancel`
+    - v1.0 客户端报结果 → `result_unsupported_version`
+    - `attempt<1` 或大过当前已投递轮次 → `invalid_state`
+  - 响应同时回 `attempt`（本结论归属的轮次）与 `current_attempt`
+    （命令当前所在轮次），调用方可直接区分“旧轮重复 / 旧轮矛盾 / 当前轮结果”。
   - 同一设备的所有生命周期动作由每设备锁串行化，因此无论动作以什么顺序到达，
-    一条命令最终只落到**一个**终态，不会出现互相矛盾的判定
-    （见 `tests/test_results.py` 的交错/并发用例）。
+    一条命令任意时刻只落到**一个**明确结论，不会出现互相矛盾的判定
+    （见 `tests/test_results.py` 的交错/并发与跨轮乱序用例）。
 - `cancel` 允许从 `QUEUED`/`SENT` 迁移；v2.0 在 `ACKED`（执行中）阶段也可取消，
   v1.0 的 `ACKED` 终态上取消返回 `INVALID_STATE`。
 - 超时由注入时钟驱动的 `expire()` 显式推进（无后台线程），判定确定、可复现。
@@ -75,7 +86,21 @@ CANCELLED (终态)   CANCELLED (终态) +--v2.0 上报失败、仍有重试名�
 ## 执行结果与自动重试
 
 - 结果包含：成功/失败、失败时的 `error_code`（失败必填）、本次执行耗时
-  `duration_ms`。每次投递的结果以 `attempt` 编号追加保存（append-only）。
+  `duration_ms`、以及**该结论应答的投递轮次 `attempt`（v2.0 必填，从 1 起）**。
+  每轮投递的结果以 `attempt` 编号追加保存（append-only，每个 attempt 至多一条）。
+
+### 重试轮次与结果归属
+
+- 投递轮次：每次 `QUEUED/SENT` 投递（首次下发或重连 `flush` 补发）都会把命令的
+  `attempt` 加一，首次=1，第 1 次重试=2，以此类推。设备侧必须在结果上报中
+  **原样回显本轮收到的 `attempt`**，网关据此把结论归属到对应轮次。
+- 归属规则只认 `(command_id, attempt)`：
+  - 某轮的**首个**结论只有在该轮处于 `ACKED` 时才驱动状态机
+    （成功→终态；失败→重排或终态）。
+  - 该轮一旦有结论，后续再到的任何同轮报文都**只做幂等判定**：相同=重复，
+    矛盾=`conflicting_result`；状态机不再被驱动第二次。
+  - 旧轮结论不会“漂”到新轮上。重排后 `attempt` 仍停在旧轮，直到重试真正下发
+    才变成新轮，因此“旧结论迟到”与“新结论首报”在任何时序下都能区分。
 - 失败后是否自动重排，由**每台设备**的 `max_retries` 策略决定（默认 0=不重试）：
   - 仍有名额（`attempt <= max_retries`）：命令以**同一 command_id** 重排到
     FIFO 队尾，不新增队列条目、不覆盖任何其它在途/排队命令；下次 `flush`
@@ -83,9 +108,68 @@ CANCELLED (终态)   CANCELLED (终态) +--v2.0 上报失败、仍有重试名�
   - 用尽名额：稳定落到 `RETRIES_EXHAUSTED`（配置过重试）或 `FAILED`
     （未配置重试），二者可区分且均为终态。
   - 成功：终态 `SUCCEEDED`。重试用尽前成功即提前结束。
+  - 旧轮失败的迟到重复包**不消耗名额**：是否消耗一次重试，只由该轮首个失败
+    结论决定，且只决定一次。
 - 重排豁免容量准入（命令已被接纳），因此“容量满 + 重试 + 重连补发”同时发生时
   仍然**不丢、不重、顺序可解释**（见
   `tests/test_retries.py::test_capacity_full_and_retry_interplay_keeps_order_no_loss`）。
+
+## 网络抖动：执行结果重复上报 / 乱序到达的复现与验证
+
+修复针对的缺陷：结果上报不携带 `attempt`，网关只按“当前状态”归属结果。重试轮
+下发并确认后，上一轮失败结果的迟到重复包会被误记成新一轮的结果——多记一条、
+再排一次重试（命令被多执行一遍）；只允许重试一次时更会直接被判成
+`RETRIES_EXHAUSTED`，导致当前轮真正的成功反被拒绝。
+
+**本地复现修复前的问题**（可用 `git` 切到修复前提交对照）：
+
+```bash
+# 修复后直接跑下列用例即可验证；修复前它们会失败/误判
+.venv/bin/python -m pytest -s \
+  tests/test_results.py::test_stale_failure_after_redelivery_and_ack_counts_once \
+  tests/test_results.py::test_stale_failure_with_single_retry_does_not_exhaust_policy \
+  tests/test_results.py::test_stale_verdict_conflicting_with_recorded_round_rejected \
+  tests/test_results.py::test_stale_duplicate_before_new_round_acked_is_idempotent
+```
+
+判定依据在测试输出里直接打印（`input:` 为关键输入，`verdict/basis:` 为归属判定
+依据）。也可用 HTTP 端到端复现一轮完整时序：
+
+```bash
+.venv/bin/python - <<'PY'
+from fastapi.testclient import TestClient
+from main import app
+c = TestClient(app)
+c.post("/devices", json={"device_id":"h","secret":"s",
+                         "protocol_version":"2.0","max_retries":1})
+c.post("/devices/h/connect")
+cid = c.post("/devices/h/commands", json={"name":"reboot"}).json()["command_id"]
+c.post(f"/devices/h/commands/{cid}/ack", json={"secret":"s"})
+# 第 1 轮失败 -> 重排（attempt=1）
+print(c.post(f"/devices/h/commands/{cid}/result",
+             json={"secret":"s","attempt":1,"success":False,
+                   "duration_ms":10,"error_code":"E_BUSY"}).json())
+c.post("/devices/h/disconnect"); c.post("/devices/h/connect")  # 第 2 轮下发
+c.post(f"/devices/h/commands/{cid}/ack", json={"secret":"s"})
+# 网络延迟：第 1 轮失败包又到一次 -> duplicate=true，不重试、不判死
+print(c.post(f"/devices/h/commands/{cid}/result",
+             json={"secret":"s","attempt":1,"success":False,
+                   "duration_ms":10,"error_code":"E_BUSY"}).json())
+# 第 2 轮真正成功 -> 正常收下，终态 SUCCEEDED
+print(c.post(f"/devices/h/commands/{cid}/result",
+             json={"secret":"s","attempt":2,"success":True,"duration_ms":3}).json())
+PY
+```
+
+期望：旧包返回 `{"accepted": true, "duplicate": true, "attempt": 1,
+"current_attempt": 2, "retried": false}`；命令最终 `SUCCEEDED`，结果记录恰为
+`attempt=1`（失败）与 `attempt=2`（成功）两条，之后 `flush` 不再产生任何补发。
+
+全量回归（命令下发、遥测幂等、离线队列、持久化等）：
+
+```bash
+.venv/bin/python -m pytest -q
+```
 
 ## 离线队列容量
 
@@ -106,8 +190,10 @@ CANCELLED (终态)   CANCELLED (终态) +--v2.0 上报失败、仍有重试名�
   检查-插入在每设备锁内完成，64 线程并发同一 message_id 仅 1 条被接受。
 - 乱序时间戳：落在窗口 `[now-24h, now+5min]` 内即接受并缓冲；
   超出窗口拒绝 `TIMESTAMP_OUT_OF_RANGE`。
-- 命令确认按 `command_id` 幂等（见上）；v2.0 的**执行结果**同样幂等：
-  相同结论重复上报只记一次，矛盾结论被 `CONFLICTING_RESULT` 拒绝。
+- 命令确认按 `command_id` 幂等（见上）；v2.0 的**执行结果**按
+  `(command_id, attempt)` 幂等：同一轮的相同结论无论重复多少次、晚到多久，
+  只记一次且不驱动第二次状态迁移；同轮矛盾结论被 `CONFLICTING_RESULT` 拒绝；
+  旧轮迟到报文按其 `attempt` 归属，绝不会被记到当前轮上。
 
 ## 协议版本兼容
 
@@ -115,7 +201,7 @@ CANCELLED (终态)   CANCELLED (终态) +--v2.0 上报失败、仍有重试名�
 | --- | --- | --- |
 | 遥测默认字段 | `seq=0`、`qos=0` | 必须提供 `seq`，`qos` 默认 0 |
 | 命令确认 `ack` | 终态 `ACKED`（已送达、结果未知，不重试） | 中间态 `ACKED`（执行中） |
-| 上报执行结果 `report_result` | **不支持**，明确拒绝 `result_unsupported_version` | 支持：成功/失败/错误码/耗时 |
+| 上报执行结果 `report_result` | **不支持**，明确拒绝 `result_unsupported_version` | 支持：成功/失败/错误码/耗时，并**必须回显投递轮次 `attempt`**（结论按轮次归属，跨轮重复/乱序安全） |
 | 失败自动重试 | 不发生（无结果可判） | 按设备 `max_retries` 执行 |
 
 - 支持版本：`1.0`、`2.0`（`SUPPORTED_VERSIONS`）。

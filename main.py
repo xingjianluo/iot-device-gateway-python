@@ -38,6 +38,9 @@ class AckRequest(BaseModel):
 
 class ResultRequest(BaseModel):
     secret: str
+    # delivery attempt this verdict answers (echoed from the dispatch);
+    # required so late/duplicate results are attributed to the right round
+    attempt: int
     success: bool
     duration_ms: int
     error_code: str | None = None
@@ -117,7 +120,14 @@ def dispatch(device_id: str, req: DispatchRequest):
     command, reason = gateway.dispatch(device_id, req.name, req.params)
     if command is None:
         return {"dispatched": False, "reason": reason.value if reason else None}
-    return {"dispatched": True, "command_id": command.command_id, "status": command.status.value}
+    return {
+        "dispatched": True,
+        "command_id": command.command_id,
+        "status": command.status.value,
+        # echo on the /result report so verdicts are attributed to this
+        # delivery round (robust against retries and jittered re-delivery)
+        "attempt": command.attempt,
+    }
 
 
 @app.post("/devices/{device_id}/commands/{command_id}/ack")
@@ -138,6 +148,7 @@ def report_result(device_id: str, command_id: str, req: ResultRequest):
         command_id,
         req.success,
         req.duration_ms,
+        req.attempt,
         req.error_code,
     )
     return {
@@ -145,6 +156,7 @@ def report_result(device_id: str, command_id: str, req: ResultRequest):
         "reason": result.reason.value if result.reason else None,
         "duplicate": result.duplicate,
         "attempt": result.attempt,
+        "current_attempt": result.current_attempt,
         "terminal": result.terminal,
         "retried": result.retried,
     }
