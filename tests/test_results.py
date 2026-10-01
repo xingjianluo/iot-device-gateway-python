@@ -19,7 +19,7 @@ def test_success_result_after_ack_is_terminal(gateway, clock):
     cmd, _ = gateway.dispatch("d1", "reboot")
     ack = gateway.ack("d1", "s", cmd.command_id)
     print(f"ack: accepted={ack.accepted} status=ACKED(intermediate for v2.0)")
-    r = gateway.report_result("d1", "s", cmd.command_id, True, 120)
+    r = gateway.report_result("d1", "s", cmd.command_id, True, 120, attempt=1)
     print(f"result: accepted={r.accepted} attempt={r.attempt} terminal={r.terminal}")
     assert r.accepted and r.terminal and r.attempt == 1
     stored = gateway.store.get_command("d1", cmd.command_id)
@@ -33,7 +33,9 @@ def test_failure_requires_error_code(gateway, clock):
     gateway.connect("d1")
     cmd, _ = gateway.dispatch("d1", "reboot")
     gateway.ack("d1", "s", cmd.command_id)
-    r = gateway.report_result("d1", "s", cmd.command_id, False, 10, None)
+    r = gateway.report_result(
+        "d1", "s", cmd.command_id, False, 10, attempt=1, error_code=None
+    )
     print(f"failure without error_code -> {r.reason}")
     assert not r.accepted and r.reason == RejectReason.INVALID_STATE
     assert gateway.store.get_command("d1", cmd.command_id).status == CommandStatus.ACKED
@@ -44,8 +46,12 @@ def test_duplicate_same_result_recorded_once(gateway, clock):
     gateway.connect("d1")
     cmd, _ = gateway.dispatch("d1", "reboot")
     gateway.ack("d1", "s", cmd.command_id)
-    r1 = gateway.report_result("d1", "s", cmd.command_id, False, 50, "E_BUSY")
-    r2 = gateway.report_result("d1", "s", cmd.command_id, False, 50, "E_BUSY")
+    r1 = gateway.report_result(
+        "d1", "s", cmd.command_id, False, 50, attempt=1, error_code="E_BUSY"
+    )
+    r2 = gateway.report_result(
+        "d1", "s", cmd.command_id, False, 50, attempt=1, error_code="E_BUSY"
+    )
     print(f"same result twice: r1.accepted={r1.accepted} r2.duplicate={r2.duplicate}")
     assert r1.accepted and not r1.duplicate
     assert r2.accepted and r2.duplicate  # idempotent
@@ -59,9 +65,11 @@ def test_conflicting_result_rejected_and_verdict_unchanged(gateway, clock):
     gateway.connect("d1")
     cmd, _ = gateway.dispatch("d1", "reboot")
     gateway.ack("d1", "s", cmd.command_id)
-    gateway.report_result("d1", "s", cmd.command_id, True, 10)
+    gateway.report_result("d1", "s", cmd.command_id, True, 10, attempt=1)
     # network retry now delivers a different (failure) verdict for the same command
-    r = gateway.report_result("d1", "s", cmd.command_id, False, 10, "E_OTHER")
+    r = gateway.report_result(
+        "d1", "s", cmd.command_id, False, 10, attempt=1, error_code="E_OTHER"
+    )
     print(f"contradicting verdict after SUCCEEDED -> {r.reason}")
     assert not r.accepted and r.reason == RejectReason.CONFLICTING_RESULT
     assert gateway.store.get_command("d1", cmd.command_id).status == CommandStatus.SUCCEEDED
@@ -71,16 +79,26 @@ def test_result_before_ack_rejected(gateway, clock):
     gateway.register("d1", "s", protocol_version="2.0")
     gateway.connect("d1")
     cmd, _ = gateway.dispatch("d1", "reboot")
-    # result arrives while command is still SENT (ack lost/in flight)
-    r_sent = gateway.report_result("d1", "s", cmd.command_id, True, 10)
-    print(f"result while SENT -> {r_sent.reason}")
+    # result for the current delivered round while command is still SENT
+    # (ack lost/in flight)
+    r_sent = gateway.report_result(
+        "d1", "s", cmd.command_id, True, 10, attempt=1
+    )
+    print(f"result for round 1 while SENT -> {r_sent.reason}")
     assert not r_sent.accepted and r_sent.reason == RejectReason.RESULT_BEFORE_ACK
-    # and while QUEUED (offline, never delivered)
+    # never-delivered command: a report naming its future round 1 names a
+    # round that does not exist yet, distinguishable from before-ack
     gateway.register("d2", "s", protocol_version="2.0")
     queued, _ = gateway.dispatch("d2", "reboot")
-    r_queued = gateway.report_result("d2", "s", queued.command_id, True, 10)
-    print(f"result while QUEUED -> {r_queued.reason}")
-    assert not r_queued.accepted and r_queued.reason == RejectReason.RESULT_BEFORE_ACK
+    r_queued = gateway.report_result(
+        "d2", "s", queued.command_id, True, 10, attempt=1
+    )
+    print(
+        f"result for an undelivered round (attempt=0, report claims 1) "
+        f"-> {r_queued.reason}"
+    )
+    assert not r_queued.accepted
+    assert r_queued.reason == RejectReason.UNKNOWN_RESULT_ATTEMPT
 
 
 def test_result_after_timeout_rejected(gateway, clock):
@@ -90,7 +108,7 @@ def test_result_after_timeout_rejected(gateway, clock):
     clock.advance(31.0)
     expired = gateway.expire()
     print(f"expired: {[c.command_id for c in expired]}")
-    r = gateway.report_result("d1", "s", cmd.command_id, True, 200)
+    r = gateway.report_result("d1", "s", cmd.command_id, True, 200, attempt=1)
     print(f"result after TIMED_OUT -> {r.reason}")
     assert not r.accepted and r.reason == RejectReason.RESULT_AFTER_TIMEOUT
     assert gateway.store.get_command("d1", cmd.command_id).status == CommandStatus.TIMED_OUT
@@ -104,7 +122,7 @@ def test_result_after_cancel_rejected(gateway, clock):
     ok, _ = gateway.cancel("d1", cmd.command_id)
     print(f"cancel while ACKED(v2.0): ok={ok}")
     assert ok
-    r = gateway.report_result("d1", "s", cmd.command_id, True, 5)
+    r = gateway.report_result("d1", "s", cmd.command_id, True, 5, attempt=1)
     print(f"result after CANCELLED -> {r.reason}")
     assert not r.accepted and r.reason == RejectReason.RESULT_AFTER_CANCEL
     assert gateway.store.get_command("d1", cmd.command_id).status == CommandStatus.CANCELLED
@@ -116,7 +134,7 @@ def test_legacy_v1_ack_is_terminal_and_results_unsupported(gateway, clock):
     cmd, _ = gateway.dispatch("old", "reboot")
     gateway.ack("old", "s", cmd.command_id)
     # v1.0 client cannot report a result: fixed semantics, never upgraded
-    r = gateway.report_result("old", "s", cmd.command_id, True, 1)
+    r = gateway.report_result("old", "s", cmd.command_id, True, 1, attempt=1)
     print(f"v1.0 result report -> {r.reason}")
     assert not r.accepted
     assert r.reason == RejectReason.RESULT_UNSUPPORTED_VERSION
@@ -145,7 +163,7 @@ def test_ack_result_cancel_expire_interleave_lands_in_one_terminal(gateway, cloc
     def do_result(_):
         return (
             "result",
-            gateway.report_result("d1", "s", cid, True, 12),
+            gateway.report_result("d1", "s", cid, True, 12, attempt=1),
         )
 
     def do_cancel(_):

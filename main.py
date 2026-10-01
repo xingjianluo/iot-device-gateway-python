@@ -40,6 +40,10 @@ class ResultRequest(BaseModel):
     secret: str
     success: bool
     duration_ms: int
+    # delivery round echoed from the dispatch/flush response; binds this
+    # result to exactly one execution so stale retransmissions of an older
+    # round cannot be mistaken for the current round's verdict
+    attempt: int
     error_code: str | None = None
 
 
@@ -138,6 +142,7 @@ def report_result(device_id: str, command_id: str, req: ResultRequest):
         command_id,
         req.success,
         req.duration_ms,
+        req.attempt,
         req.error_code,
     )
     return {

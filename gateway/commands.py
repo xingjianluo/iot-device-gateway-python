@@ -27,17 +27,20 @@ Rules:
   rejected with INVALID_STATE. For v1.0 devices ACKED is terminal, so a
   racing cancel can no longer overwrite it; for v2.0 devices ACKED is an
   intermediate "executing" state.
-- report_result() (v2.0 only) legal only from ACKED. Reports arriving out
-  of order are each rejected with a distinguishable reason: before ack ->
-  RESULT_BEFORE_ACK, after timeout -> RESULT_AFTER_TIMEOUT, after cancel
-  -> RESULT_AFTER_CANCEL, legacy client -> RESULT_UNSUPPORTED_VERSION.
-  Repeating the same (success, error_code) verdict for a terminal command
-  is a duplicate and never changes the recorded conclusion; a *different*
-  verdict is rejected with CONFLICTING_RESULT. (A duplicate of an older
-  attempt's verdict that arrives only after the command was requeued for
-  retry lands while the command is QUEUED/SENT: only the currently ACKED
-  attempt accepts results, so it is reported as RESULT_BEFORE_ACK and
-  changes nothing -- the earlier verdict was already recorded once.)
+- report_result() (v2.0 only) carries the *attempt* (delivery round) the
+  device is reporting, so every result is owned by its round rather than by
+  the command's current lifecycle state. The only round that may introduce a
+  new verdict is the one currently ACKED. A result for an already recorded
+  round is idempotent however late it arrives and at whatever stage (QUEUED/
+  SENT/ACKED/terminal): an identical (success, error_code) verdict returns
+  duplicate=True, a contradictory one is rejected CONFLICTING_RESULT -- it
+  is never counted twice, never requeues another retry, and never overwrites
+  the current round. A result for a superseded round with no recorded
+  verdict is rejected STALE_RESULT_ATTEMPT; one for a round never delivered
+  is rejected UNKNOWN_RESULT_ATTEMPT. Out-of-order results for the *current*
+  round each get a distinguishable reason: before ack -> RESULT_BEFORE_ACK,
+  after timeout -> RESULT_AFTER_TIMEOUT, after cancel -> RESULT_AFTER_CANCEL,
+  legacy client -> RESULT_UNSUPPORTED_VERSION.
   Every lifecycle action is serialized by the per-device lock, so however
   ack/result/cancel/expire interleave, a command lands in exactly one
   terminal state.
@@ -60,6 +63,7 @@ from typing import Any
 from .devices import DeviceRegistry
 from .models import (
     TERMINAL_AFTER_ACK_VERSIONS,
+    TERMINAL_COMMAND_STATES,
     AckResult,
     AttemptResult,
     Clock,
@@ -199,6 +203,7 @@ class CommandService:
         command_id: str,
         success: bool,
         duration_ms: int,
+        attempt: int,
         error_code: str | None = None,
     ) -> ResultReportResult:
         device, reason = self._registry.authenticate(device_id, secret)
@@ -212,7 +217,13 @@ class CommandService:
                 accepted=False,
                 reason=RejectReason.RESULT_UNSUPPORTED_VERSION,
             )
-        if duration_ms < 0 or (not success and not error_code):
+        if (
+            duration_ms < 0
+            or (not success and not error_code)
+            or not isinstance(attempt, int)
+            or isinstance(attempt, bool)
+            or attempt < 1
+        ):
             return ResultReportResult(
                 accepted=False, reason=RejectReason.INVALID_STATE
             )
@@ -222,6 +233,73 @@ class CommandService:
                 return ResultReportResult(
                     accepted=False, reason=RejectReason.UNKNOWN_COMMAND
                 )
+
+            # (1) Attempt ownership first and always. Each delivery round
+            # (QUEUED->SENT) gets its own attempt number and the device echoes
+            # it with the result. A result is keyed to that round, NOT to the
+            # command's current lifecycle state: a jitter-delayed duplicate
+            # of round 1 must therefore be recognised as round 1's duplicate
+            # whether it lands while the retry is QUEUED, SENT, ACKED, or
+            # already settled. It can never consume a retry slot, drive an
+            # extra requeue/execution, or overwrite the current round.
+            recorded = next(
+                (r for r in command.results if r.attempt == attempt), None
+            )
+            if recorded is not None:
+                # Same round already has its one verdict. An identical echo is
+                # the exact same execution result, however late: accepted as a
+                # duplicate and changes nothing. A different verdict for the
+                # same round is contradictory and cannot replace the recorded
+                # one either.
+                command.result_count += 1  # observation only
+                self._store._persist()
+                if (
+                    recorded.success == success
+                    and recorded.error_code == error_code
+                ):
+                    return ResultReportResult(
+                        accepted=True,
+                        duplicate=True,
+                        attempt=recorded.attempt,
+                        terminal=command.status in TERMINAL_COMMAND_STATES,
+                    )
+                return ResultReportResult(
+                    accepted=False,
+                    reason=RejectReason.CONFLICTING_RESULT,
+                    attempt=recorded.attempt,
+                    terminal=command.status in TERMINAL_COMMAND_STATES,
+                )
+
+            # No recorded verdict for the claimed round. Only the round that
+            # is currently ACKED may introduce a new verdict.
+            if attempt < command.attempt:
+                # Superseded round whose original verdict never reached us
+                # (e.g. it was lost and the command was retried only after an
+                # ack timeout -- retries driven by reported failures always
+                # have that failure recorded first). It arrives too late to
+                # change anything; the round is over.
+                command.result_count += 1
+                self._store._persist()
+                return ResultReportResult(
+                    accepted=False,
+                    reason=RejectReason.STALE_RESULT_ATTEMPT,
+                    attempt=attempt,
+                    terminal=command.status in TERMINAL_COMMAND_STATES,
+                )
+            if attempt > command.attempt:
+                # A round that has never even been delivered cannot have a
+                # result yet: a mis-tagged/replayed future report.
+                command.result_count += 1
+                self._store._persist()
+                return ResultReportResult(
+                    accepted=False,
+                    reason=RejectReason.UNKNOWN_RESULT_ATTEMPT,
+                    attempt=attempt,
+                    terminal=command.status in TERMINAL_COMMAND_STATES,
+                )
+
+            # attempt == command.attempt: verdict for the *current* round.
+            # Lifecycle-state gates below apply only to that current round.
             status = command.status
             if status in (CommandStatus.QUEUED, CommandStatus.SENT):
                 return ResultReportResult(
@@ -238,22 +316,13 @@ class CommandService:
             if status == CommandStatus.ACKED:
                 return self._record_result(device, command, success,
                                            duration_ms, error_code)
-            # already settled: the conclusion is fixed. An identical
-            # verdict is a duplicate; a contradictory one is rejected.
-            last = command.results[-1]
-            command.result_count += 1  # observation only
-            self._store._persist()
-            if last.success == success and last.error_code == error_code:
-                return ResultReportResult(
-                    accepted=True,
-                    duplicate=True,
-                    attempt=last.attempt,
-                    terminal=True,
-                )
+            # Defensive: terminal command with no result for the current
+            # round is not reachable via the state machine. Refuse rather
+            # than invent a verdict.
             return ResultReportResult(
                 accepted=False,
-                reason=RejectReason.CONFLICTING_RESULT,
-                attempt=last.attempt,
+                reason=RejectReason.INVALID_STATE,
+                attempt=attempt,
                 terminal=True,
             )
 

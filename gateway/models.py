@@ -52,6 +52,10 @@ class RejectReason(str, enum.Enum):
     RESULT_AFTER_TIMEOUT = "result_after_timeout"
     RESULT_AFTER_CANCEL = "result_after_cancel"
     CONFLICTING_RESULT = "conflicting_result"
+    # result report names a delivery attempt that is not the currently
+    # ACKED round: an older superseded round (stale) or one never delivered
+    STALE_RESULT_ATTEMPT = "stale_result_attempt"
+    UNKNOWN_RESULT_ATTEMPT = "unknown_result_attempt"
     # offline queue capacity
     QUEUE_FULL = "queue_full"
 

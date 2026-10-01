@@ -56,18 +56,27 @@ CANCELLED (终态)   CANCELLED (终态) +--v2.0 上报失败、仍有重试名�
   - **v1.0 客户端**：`ACKED` 就是它的终态（“已送达，结果未知”），
     网关绝不替它推断成功/失败，也不会重试；竞争中的取消也无法再推翻它。
   - **v2.0 客户端**：`ACKED` 只是“已收到、执行中”的中间态。
-- `report_result`（**仅 v2.0**）只能在 `ACKED` 上被接受。网络抖动导致
-  ack/结果/取消/超时乱序到达时，每种越序到达都有**可互相区分的拒绝原因**：
-  - 未确认先报结果（`QUEUED`/`SENT`）→ `result_before_ack`
-  - 超时后报结果 → `result_after_timeout`
-  - 取消后报结果 → `result_after_cancel`
-  - v1.0 客户端报结果 → `result_unsupported_version`
-  - 对已定终态再报**相同**结论（success+error_code 相同）→
-    `accepted=true, duplicate=true`，只记一次、结论不变；
-    报**矛盾**结论 → `conflicting_result`，既定结论不被改变。
+- `report_result`（**仅 v2.0**）每次上报**必须携带投递时收到的轮次号
+  `attempt`**，结果按“属于哪一轮投递”归属，而不是按命令当前所处的状态归属
+  （详见下一节“重试轮次与结果归属”）。只有**当前正处于 `ACKED` 的那一轮**
+  才能引入新结论。网络抖动导致 ack/结果/取消/超时乱序、旧结果延迟重传时，
+  每种情况都有**可互相区分的判定**：
+  - **已记录过的轮次再次上报（无论多晚、处于什么阶段到达）**：
+    结论相同（success+error_code 相同）→ `accepted=true, duplicate=true`，
+    只记一次、状态不移动（不重排、不重试、不改变既定结论）；
+    结论不同 → `conflicting_result` 拒绝，已记录结论不被顶替。
+  - 上报了一个**更老、已被取代且当时没有留下记录**的轮次 →
+    `stale_result_attempt`（该轮已结束，迟到的结果不能影响当前轮）。
+  - 上报了一个**尚未投递、根本不存在**的轮次（如轮次号偏大、或 0）→
+    `unknown_result_attempt` / `invalid_state`，绝不误记成当前轮结果。
+  - 当前轮在未确认前（`QUEUED`/`SENT`）报结果 → `result_before_ack`；
+    超时后报结果 → `result_after_timeout`；取消后报结果 →
+    `result_after_cancel`；v1.0 客户端报结果 →
+    `result_unsupported_version`。
   - 同一设备的所有生命周期动作由每设备锁串行化，因此无论动作以什么顺序到达，
     一条命令最终只落到**一个**终态，不会出现互相矛盾的判定
-    （见 `tests/test_results.py` 的交错/并发用例）。
+    （见 `tests/test_results.py` 的交错/并发用例与
+    `tests/test_result_ordering.py` 的旧结果重传/乱序用例）。
 - `cancel` 允许从 `QUEUED`/`SENT` 迁移；v2.0 在 `ACKED`（执行中）阶段也可取消，
   v1.0 的 `ACKED` 终态上取消返回 `INVALID_STATE`。
 - 超时由注入时钟驱动的 `expire()` 显式推进（无后台线程），判定确定、可复现。
@@ -86,6 +95,36 @@ CANCELLED (终态)   CANCELLED (终态) +--v2.0 上报失败、仍有重试名�
 - 重排豁免容量准入（命令已被接纳），因此“容量满 + 重试 + 重连补发”同时发生时
   仍然**不丢、不重、顺序可解释**（见
   `tests/test_retries.py::test_capacity_full_and_retry_interplay_keeps_order_no_loss`）。
+
+## 重试轮次与结果归属（重复上报 / 乱序到达判定）
+
+每条命令的每次投递（`QUEUED->SENT`）是一个**轮次**，`attempt` 从 1 起递增，
+设备在结果上报中原样回传该轮次号。网关对结果的第一判定键是
+`(command_id, attempt)`，其次才是命令当前的生命周期状态：
+
+1. **该轮次已有记录**（重复上报）：它就是那一次执行的同一个结果，
+   **无论晚多久、在 `QUEUED`/`SENT`/`ACKED`/任一终态哪个阶段到达**——
+   - 结论相同 → 幂等重复（`duplicate=true`），不追加记录、不重排、不重试、
+     不改写任何已定结论；
+   - 结论不同 → `conflicting_result` 拒绝，旧结论与当前轮都不被顶替。
+   这正是修复的核心：第 1 轮失败已记录并重试后，网络重传的那份**旧失败**
+   永远属于第 1 轮，不会在第 2 轮 `ACKED` 时被当成第 2 轮的新失败，
+   因而既不会多排一次重试/多执行一遍，也不会把命令提前判成
+   `RETRIES_EXHAUSTED`；第 2 轮真正的成功结果仍照常收下并判定为
+   `SUCCEEDED`（`max_retries=1` 时同样成立）。
+2. **轮次号更老、但该轮没有任何记录**（`attempt < 当前轮`）：该轮已被
+   取代且已结束，迟到结果判 `stale_result_attempt`，只观察、不改状态。
+   正常失败重试流程中第 1 轮必然先留下失败记录（走第 1 条），此分支只用于
+   内部恢复等防御路径。
+3. **轮次号指向尚未投递的轮次**（`attempt > 当前轮`，或 `attempt<1`）：
+   `unknown_result_attempt` / `invalid_state`，绝不误算成当前轮结果。
+4. **轮次号等于当前轮**时再套用生命周期状态门：未确认 `result_before_ack`、
+   超时后 `result_after_timeout`、取消后 `result_after_cancel`、
+   v1.0 `result_unsupported_version`。
+
+不变量：任何一条命令在任意时刻**只有一个明确结论**；同一次执行的同一个结果
+**只算一次**；重复的旧结果**不吃掉重试名额、不多产生一次投递、不顶替当前轮
+真正的结果**。每设备锁保证上述判定在并发/乱序下依然稳定。
 
 ## 离线队列容量
 
@@ -134,7 +173,7 @@ CANCELLED (终态)   CANCELLED (终态) +--v2.0 上报失败、仍有重试名�
 `duplicate_telemetry` / `unsupported_version` / `unknown_command` /
 `invalid_state` / `result_unsupported_version` / `result_before_ack` /
 `result_after_timeout` / `result_after_cancel` / `conflicting_result` /
-`queue_full`
+`stale_result_attempt` / `unknown_result_attempt` / `queue_full`
 
 ## 本地验证
 
@@ -152,7 +191,11 @@ uv run uvicorn main:app # 启动 HTTP 服务，文档见 http://127.0.0.1:8000/d
   **24 ack + 24 结果 + 24 取消 + 8 超时并发交错**只落一个终态。
 - `tests/test_retries.py`：attempt 递增、重连补发不重复、成功提前结束、
   到顶 `RETRIES_EXHAUSTED`、重排队尾顺序、容量×重试交织不丢、
+  **旧轮次结果在重试 `QUEUED`/`ACKED` 阶段重传（含相同与矛盾结论）只算一次**、
   v1.0 即使配置了策略也不重试、策略持久化。
+- `tests/test_result_ordering.py`（本次修复新增）：失败重排→重新下发并再次
+  确认后旧失败才到达；只允许重试一次时被旧结果提前判死；旧结果与当前轮结果
+  不一致；新一轮未确认前旧结果反复重传；上报未投递轮次/已关闭轮次。
 - `tests/test_queue.py`：容量边界（含 0）、满/排空、按设备独立、占用查询、
   调小容量不丢命令。
 
@@ -169,11 +212,19 @@ curl -X POST localhost:8000/devices/dev-1/commands \
 CID=cmd-1
 curl -X POST localhost:8000/devices/dev-1/commands/$CID/ack \
   -H 'content-type: application/json' -d '{"secret":"pw"}'
-# 执行失败：重排重试（retried=true, terminal=false）
+# 执行失败：重排重试（retried=true, terminal=false），该结果属于第 1 轮
 curl -X POST localhost:8000/devices/dev-1/commands/$CID/result \
   -H 'content-type: application/json' \
-  -d '{"secret":"pw","success":false,"duration_ms":120,"error_code":"E_BUSY"}'
+  -d '{"secret":"pw","success":false,"duration_ms":120,"attempt":1,"error_code":"E_BUSY"}'
 curl -X POST localhost:8000/devices/dev-1/flush                 # 补发 attempt=2
+# 网络抖动：第 1 轮的旧失败此刻才重传到 -> duplicate=true，不重排、不改结论
+curl -X POST localhost:8000/devices/dev-1/commands/$CID/result \
+  -H 'content-type: application/json' \
+  -d '{"secret":"pw","success":false,"duration_ms":120,"attempt":1,"error_code":"E_BUSY"}'
+# 第 2 轮真正执行成功 -> accepted=true, terminal=true，命令落 SUCCEEDED
+curl -X POST localhost:8000/devices/dev-1/commands/$CID/result \
+  -H 'content-type: application/json' \
+  -d '{"secret":"pw","success":true,"duration_ms":80,"attempt":2}'
 curl localhost:8000/devices/dev-1/queue                         # queued/capacity/full
 curl localhost:8000/devices/dev-1/state                         # 状态 + 每次结果
 
@@ -184,3 +235,37 @@ curl -X POST localhost:8000/devices/dev-1/policy \
 
 HTTP 服务默认将状态持久化到 `gateway_state.json`（重启后状态、去重集合、
 离线队列均保留）；测试使用临时路径与注入时钟，互不干扰。
+
+### 本地复现“旧结果迟到”问题并确认已修复
+
+不依赖网络，用注入时钟在进程内模拟“失败重排 → 重新下发并确认 →
+旧失败重传 → 当前轮真正成功”的乱序：
+
+```bash
+uv run python - << 'EOF'
+from tests.conftest import FakeClock
+from gateway.service import Gateway
+
+g = Gateway(clock=FakeClock())           # max_retries=1：最容易被旧结果提前判死
+g.register("d1", "s", protocol_version="2.0", max_retries=1)
+g.connect("d1")
+cmd, _ = g.dispatch("d1", "reboot"); cid = cmd.command_id
+
+g.ack("d1", "s", cid)                                                 # 第 1 轮确认
+print(g.report_result("d1", "s", cid, False, 100, attempt=1, error_code="E_BUSY"))  # 失败重排
+g.flush("d1"); g.ack("d1", "s", cid")                                  # 补发第 2 轮并确认
+stale = g.report_result("d1", "s", cid, False, 100, attempt=1, error_code="E_BUSY") # 旧失败迟到
+print("stale:", stale.accepted, stale.duplicate, stale.retried)       # 期望 True/True/False
+real = g.report_result("d1", "s", cid, True, 80, attempt=2)           # 第 2 轮真正成功
+print("real: ", real.accepted, real.terminal)                         # 期望 True/True
+print(g.store.get_command("d1", cid).status)                           # 期望 CommandStatus.SUCCEEDED
+EOF
+```
+
+判定依据：旧结果用 `attempt=1` 上报，因第 1 轮已有**相同**记录而返回
+`duplicate=true` 且 `retried=false`，命令仍是第 2 轮 `ACKED`；随后
+`attempt=2` 的成功被正常接受，最终 `SUCCEEDED`、每轮结果各一条。
+修复前同样的乱序会把旧失败当成第 2 轮新失败，命令被判
+`RETRIES_EXHAUSTED`，随后的成功反被 `conflicting_result` 拒绝。
+稳定回归用例见 `tests/test_result_ordering.py`（`uv run pytest -q -s`
+可看到每一步的关键输入与判定依据）。
